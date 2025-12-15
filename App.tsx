@@ -1,8 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Layout } from './components/Layout';
 import { SectionEditor } from './components/SectionEditor';
-import { ResearchState, PaperSectionType, PaperSection, UploadedFile } from './types';
-import { analyzeFilesForNovelty, generateSectionContent } from './services/geminiService';
+import { ResearchState, PaperSectionType, UploadedFile, ChatMessage } from './types';
+import { analyzeFilesForNovelty, generateSectionContent, consultCPO } from './services/geminiService';
 
 const INITIAL_SECTIONS: PaperSectionType[] = [
   PaperSectionType.Title,
@@ -18,6 +18,16 @@ const INITIAL_SECTIONS: PaperSectionType[] = [
 
 const LOCAL_STORAGE_KEY = 'novus_academica_state';
 
+// Helper to format file size
+const formatBytes = (bytes: number, decimals = 1) => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+};
+
 export default function App() {
   const [state, setState] = useState<ResearchState>({
     files: [],
@@ -28,6 +38,9 @@ export default function App() {
     methodologyPlan: '',
     expectedResults: '',
     qualityChecklist: null,
+    extractedReferences: [],
+    chatHistory: [],
+    isChatOpen: false,
     sections: INITIAL_SECTIONS.map(type => ({
       id: type,
       type,
@@ -43,361 +56,422 @@ export default function App() {
   const [apiKeyMissing, setApiKeyMissing] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [lastSaved, setLastSaved] = useState<Date | null>(null);
+  const [chatInput, setChatInput] = useState("");
+  const [isChatting, setIsChatting] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Initial Load
   useEffect(() => {
-    if (!process.env.API_KEY) {
-      setApiKeyMissing(true);
-    }
+    if (!process.env.API_KEY) setApiKeyMissing(true);
     const saved = localStorage.getItem(LOCAL_STORAGE_KEY);
     if (saved) {
-      try {
+      try { 
         const parsed = JSON.parse(saved);
-        setState(parsed);
+        // We might not have saved files to avoid quota limits, so we keep existing files if any, or empty
+        setState(prev => ({ ...parsed, files: parsed.files || [] })); 
       } catch (e) { console.error("Auto-load failed"); }
     }
   }, []);
 
-  // Auto-Save Effect
   useEffect(() => {
     const timer = setTimeout(() => {
-      if (state.files.length > 0 || state.paperTitle) {
-        saveProject(true);
-      }
-    }, 5000); // Debounce 5s
-
+      if (state.paperTitle || state.chatHistory.length > 0) saveProject(true);
+    }, 5000);
     return () => clearTimeout(timer);
   }, [state]);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setErrorMsg(null);
-    if (e.target.files && e.target.files.length > 0) {
-      const newFiles: UploadedFile[] = [];
-      Array.from(e.target.files).forEach((file: File) => {
-        if (file.type !== 'application/pdf' && file.type !== 'text/plain' && !file.name.endsWith('.txt')) {
-           alert(`File ${file.name} is skipped. Only PDF and TXT files are supported currently.`);
-           return;
-        }
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [state.chatHistory, state.isChatOpen]);
 
-        const reader = new FileReader();
-        reader.onload = (loadEvent) => {
-          const result = loadEvent.target?.result as string;
-          if (result) {
-            newFiles.push({
-              name: file.name,
-              type: file.type || 'application/octet-stream', 
-              data: result
-            });
-            setState(prev => ({ ...prev, files: [...prev.files, ...newFiles] }));
-          }
-        };
+  const readFileAsData = (file: File): Promise<UploadedFile> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        resolve({
+          name: file.name,
+          type: file.type || 'application/octet-stream',
+          data: reader.result as string
+        });
+      };
+      reader.onerror = reject;
+      
+      // Smart reading: Text for text files (smaller), Base64 for PDF/Images
+      if (file.type.includes('pdf') || file.type.includes('image')) {
         reader.readAsDataURL(file);
-      });
+      } else {
+        // Read as DataURL for consistency in current backend, but we could optimize to readAsText
+        // The service currently expects base64 for everything or handles it.
+        // Let's stick to DataURL for maximum compatibility with the current service layer
+        // which expects a base64 string or parses it.
+        reader.readAsDataURL(file);
+      }
+    });
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    setErrorMsg(null);
+    if (!e.target.files || e.target.files.length === 0) return;
+
+    const selectedFiles = Array.from(e.target.files);
+    const validFiles = selectedFiles.filter((file: File) => {
+      const name = file.name.toLowerCase();
+      // Expanded support
+      return name.endsWith('.pdf') || 
+             name.endsWith('.txt') || 
+             name.endsWith('.md') || 
+             name.endsWith('.tex') || 
+             name.endsWith('.latex') ||
+             file.type.includes('text') ||
+             file.type.includes('pdf');
+    });
+
+    if (validFiles.length === 0) {
+      setErrorMsg("No supported files found. Please upload PDF, TXT, MD, or TEX.");
+      return;
     }
+
+    setAnalyzing(true); // Show a busy state briefly while reading
+    try {
+      const processedFiles = await Promise.all(validFiles.map(readFileAsData));
+      setState(prev => ({
+        ...prev,
+        files: [...prev.files, ...processedFiles]
+      }));
+    } catch (err) {
+      setErrorMsg("Failed to read files. Please try again.");
+    } finally {
+      setAnalyzing(false);
+      // Reset input so same files can be selected again if needed
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const removeFile = (index: number) => {
+    setState(prev => ({
+      ...prev,
+      files: prev.files.filter((_, i) => i !== index)
+    }));
   };
 
   const saveProject = (silent = false) => {
     try {
-      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
+      // SMART SAVE: If files are huge, don't save them to localStorage to avoid quota crash.
+      // We calculate rough size.
+      const stateString = JSON.stringify(state);
+      if (stateString.length > 4500000) { // ~4.5MB safety limit
+        // Create a lightweight version without file data
+        const lightState = { ...state, files: [] };
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(lightState));
+        if (!silent) console.warn("Project saved (Files excluded due to size limits).");
+      } else {
+        localStorage.setItem(LOCAL_STORAGE_KEY, stateString);
+      }
       setLastSaved(new Date());
-      if (!silent) alert("Project saved successfully!");
-    } catch (e: any) {
-      if (
-        e.name === 'QuotaExceededError' ||
-        e.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
-        e.code === 22
-      ) {
-        if (!silent && confirm("Storage limit exceeded (files are too large). Save text content only?")) {
-          const textOnlyState = {
-            ...state,
-            files: state.files.map(f => ({ ...f, data: '' }))
-          };
-          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(textOnlyState));
-          setLastSaved(new Date());
-        }
-      } else if (!silent) {
-        alert("Failed to save project: " + e.message);
+      if (!silent) alert("Project saved!");
+    } catch (e) {
+      // If it still fails, try saving strictly content
+      try {
+        const minimalState = { ...state, files: [], chatHistory: state.chatHistory.slice(-5) };
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(minimalState));
+      } catch (innerE) {
+        if (!silent) alert("Storage Full: Could not auto-save.");
       }
     }
   };
 
-  const exportPaper = () => {
-    const header = `# ${state.paperTitle}\n\n`;
-    const meta = `**Target Journal:** ${state.targetJournal}\n\n`;
-    const body = state.sections.map(s => `${s.content}\n\n`).join('');
-    const fullText = header + meta + body;
-    
-    const blob = new Blob([fullText], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'draft_manuscript.md';
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
   const startResearch = async () => {
-    if (state.files.length === 0) return alert("Please upload research materials (PDF/TXT) first.");
-    const hasData = state.files.every(f => f.data && f.data.length > 0);
-    if (!hasData) return alert("File data is missing. Please re-upload source files.");
-
+    if (state.files.length === 0) return alert("Upload files first.");
     setAnalyzing(true);
     setErrorMsg(null);
-    
     try {
-      const analysis = await analyzeFilesForNovelty(state.files);
+      const result = await analyzeFilesForNovelty(state.files);
       setState(prev => {
-        const updatedSections = prev.sections.map(s => 
-            s.type === PaperSectionType.Title 
-            ? { ...s, content: `# ${analysis.title}` } 
-            : s
-        );
-
+        const updatedSections = prev.sections.map(s => s.type === PaperSectionType.Title ? { ...s, content: `# ${result.title}` } : s);
         return {
           ...prev,
-          paperTitle: analysis.title,
-          researchGap: analysis.gap,
-          noveltyClaim: analysis.novelty,
-          targetJournal: analysis.target_journal,
-          methodologyPlan: analysis.methodology_plan,
-          expectedResults: analysis.expected_results,
-          qualityChecklist: analysis.checklist,
-          sections: updatedSections
+          paperTitle: result.title,
+          researchGap: result.gap,
+          noveltyClaim: result.novelty,
+          targetJournal: result.target_journal,
+          methodologyPlan: result.methodology_plan,
+          expectedResults: result.expected_results,
+          qualityChecklist: result.checklist,
+          extractedReferences: result.references || [],
+          sections: updatedSections,
+          chatHistory: [...prev.chatHistory, { role: 'model', text: `I have analyzed ${state.files.length} documents. We are targeting ${result.target_journal}. I identified a gap in ${result.gap}. Shall we begin drafting?`, timestamp: Date.now() }],
+          isChatOpen: true
         };
       });
-    } catch (err: any) {
-      console.error(err);
-      setErrorMsg(`Analysis failed: ${err.message || "Unknown error."}`);
-    } finally {
-      setAnalyzing(false);
-    }
+    } catch (err: any) { setErrorMsg(`Analysis failed: ${err.message}`); } finally { setAnalyzing(false); }
   };
 
   const handleGenerateSection = async (sectionId: string) => {
-    if (!state.noveltyClaim) return alert("Run 'Deep Analysis' first.");
-    const hasData = state.files.every(f => f.data && f.data.length > 0);
-    if (!hasData) return alert("File data is missing. Re-upload files.");
-
-    setState(prev => ({
-      ...prev,
-      sections: prev.sections.map(s => s.id === sectionId ? { ...s, isGenerating: true } : s)
-    }));
-
+    if (!state.noveltyClaim) return alert("Run Analysis first.");
+    setState(prev => ({ ...prev, sections: prev.sections.map(s => s.id === sectionId ? { ...s, isGenerating: true } : s) }));
     const section = state.sections.find(s => s.id === sectionId);
     if (!section) return;
-
-    const otherSections = state.sections
-      .filter(s => s.id !== sectionId && s.content.length > 0)
-      .map(s => ({ type: s.type, content: s.content }));
-
     const content = await generateSectionContent(section.type, {
-      files: state.files,
-      title: state.paperTitle,
-      gap: state.researchGap,
-      novelty: state.noveltyClaim,
-      targetJournal: state.targetJournal,
-      methodologyPlan: state.methodologyPlan,
-      expectedResults: state.expectedResults,
-      otherSections
+      files: state.files, title: state.paperTitle, gap: state.researchGap, novelty: state.noveltyClaim,
+      targetJournal: state.targetJournal, methodologyPlan: state.methodologyPlan,
+      otherSections: state.sections.filter(s => s.id !== sectionId && s.content.length > 0)
     });
-
-    setState(prev => ({
-      ...prev,
-      sections: prev.sections.map(s => s.id === sectionId ? { ...s, isGenerating: false, content } : s)
-    }));
+    setState(prev => ({ ...prev, sections: prev.sections.map(s => s.id === sectionId ? { ...s, isGenerating: false, content } : s) }));
   };
 
-  const handleUpdateSection = (sectionId: string, newContent: string) => {
-    setState(prev => ({
-      ...prev,
-      sections: prev.sections.map(s => s.id === sectionId ? { ...s, content: newContent } : s)
-    }));
+  const handleChatSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+    const userMsg: ChatMessage = { role: 'user', text: chatInput, timestamp: Date.now() };
+    setState(prev => ({ ...prev, chatHistory: [...prev.chatHistory, userMsg] }));
+    setChatInput("");
+    setIsChatting(true);
+    
+    const replyText = await consultCPO(userMsg.text, state.chatHistory, { title: state.paperTitle, gap: state.researchGap, novelty: state.noveltyClaim });
+    
+    setIsChatting(false);
+    setState(prev => ({ ...prev, chatHistory: [...prev.chatHistory, { role: 'model', text: replyText, timestamp: Date.now() }] }));
   };
 
   const SidebarContent = (
     <div className="px-4 py-2 space-y-6">
       <div className="space-y-2">
-        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex justify-between">
-            <span>Resources</span>
-            {lastSaved && <span className="text-teal-500/80 font-normal normal-case">Saved {lastSaved.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>}
+        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex justify-between items-center">
+          <span>Source Data Deck</span>
+          <span className="text-[10px] text-slate-500 bg-slate-900 px-2 py-0.5 rounded-full border border-slate-800">{state.files.length} Files</span>
         </label>
-        <div className="border-2 border-dashed border-slate-700 rounded-lg p-4 hover:border-teal-500 transition-all cursor-pointer relative group bg-slate-900/50">
+        
+        <div className="border-2 border-dashed border-slate-700 rounded-lg p-6 hover:border-teal-500 transition-all cursor-pointer relative group bg-slate-900/50 flex flex-col items-center justify-center gap-2">
           <input 
+            ref={fileInputRef}
             type="file" 
             multiple 
-            accept=".pdf,.txt" 
+            accept=".pdf,.txt,.md,.tex,.latex" 
             onChange={handleFileUpload} 
-            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" 
           />
-          <div className="text-center group-hover:scale-105 transition-transform">
-            <svg className="w-8 h-8 mx-auto text-slate-500 group-hover:text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-            </svg>
-            <p className="text-xs text-slate-400 mt-2 font-medium">Drop PDF/TXT Research</p>
+          <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center group-hover:scale-110 transition-transform shadow-lg">
+            <svg className="w-5 h-5 text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
           </div>
+          <p className="text-[10px] text-slate-400 font-medium uppercase tracking-wide">Drop PDF / TXT / MD</p>
         </div>
-        <div className="space-y-1 max-h-32 overflow-y-auto custom-scrollbar">
-          {state.files.map((f, i) => (
-            <div key={i} className="flex items-center text-xs text-slate-300 bg-slate-900 p-2 rounded border border-slate-800">
-               <span className="truncate flex-1 font-mono">{f.name}</span>
-               {(!f.data || f.data.length === 0) && <span className="text-amber-500 text-[10px] ml-1" title="Data missing">⚠️</span>}
+
+        {state.files.length > 0 && (
+          <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-1">
+            {state.files.map((f, i) => (
+              <div key={i} className="flex items-center justify-between text-xs text-slate-300 bg-slate-900 p-2.5 rounded border border-slate-800 hover:border-slate-600 transition-colors group">
+                 <div className="flex items-center gap-2 overflow-hidden">
+                    <span className="text-slate-500">
+                      {f.name.endsWith('.pdf') ? '📕' : '📄'}
+                    </span>
+                    <span className="truncate font-mono text-[11px]">{f.name}</span>
+                 </div>
+                 <div className="flex items-center gap-2">
+                   <span className="text-[9px] text-slate-600">{formatBytes(f.data.length * 0.75)}</span>
+                   <button 
+                     onClick={() => removeFile(i)}
+                     className="text-slate-600 hover:text-red-400 transition-colors p-1"
+                     title="Remove file"
+                   >
+                     ✕
+                   </button>
+                 </div>
+              </div>
+            ))}
+            <div className="text-center pt-2">
+               <button 
+                 onClick={() => setState(prev => ({ ...prev, files: [] }))}
+                 className="text-[10px] text-red-500/70 hover:text-red-400 underline decoration-red-900/50"
+               >
+                 Clear All Sources
+               </button>
             </div>
-          ))}
-        </div>
+          </div>
+        )}
       </div>
 
-      <div className="space-y-3">
-        <button 
-          onClick={startResearch}
-          disabled={analyzing || state.files.length === 0}
-          className={`w-full py-3 px-4 rounded text-sm font-bold tracking-wide transition-all flex justify-center items-center ${
-            state.files.length > 0
-            ? 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-lg shadow-indigo-900/50'
-            : 'bg-slate-800 text-slate-500 cursor-not-allowed'
-          }`}
-        >
-          {analyzing ? (
-              <>
-                <svg className="animate-spin -ml-1 mr-2 h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                CPO Analyzing...
-              </>
-          ) : '1. Run Q1 Analysis'}
-        </button>
+      <button onClick={startResearch} disabled={analyzing || state.files.length === 0} className={`w-full py-4 px-4 rounded text-xs font-bold tracking-wide uppercase transition-all shadow-xl ${state.files.length > 0 ? 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white transform hover:-translate-y-0.5' : 'bg-slate-800 text-slate-500 cursor-not-allowed'}`}>
+        {analyzing ? (
+          <span className="flex items-center justify-center gap-2">
+            <svg className="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+            Analyzing Deck...
+          </span>
+        ) : 'Initialize CPO Protocol'}
+      </button>
 
-        <div className="grid grid-cols-2 gap-2">
-            <button 
-                onClick={exportPaper}
-                disabled={!state.paperTitle}
-                className="col-span-2 py-2 px-3 rounded text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-teal-400 border border-slate-700 transition-colors flex items-center justify-center gap-2"
-            >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                Export Manuscript
-            </button>
-        </div>
-      </div>
-
-      {errorMsg && (
-        <div className="bg-red-900/50 border border-red-800 text-red-200 p-3 rounded text-xs break-words">
-          {errorMsg}
+      {state.extractedReferences.length > 0 && (
+        <div className="space-y-2 pt-4 border-t border-slate-800">
+           <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-2">
+             <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
+             Detected Sources
+           </label>
+           <div className="max-h-32 overflow-y-auto custom-scrollbar space-y-1">
+             {state.extractedReferences.map((ref, i) => (
+               <div key={i} className="text-[10px] text-slate-400 p-1.5 bg-slate-900/50 rounded border border-slate-800/50 truncate hover:text-slate-200 transition-colors">{ref}</div>
+             ))}
+           </div>
         </div>
       )}
 
-      <nav className="space-y-1">
-        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-2">Blueprint</label>
+      <div className="space-y-1 pt-4 border-t border-slate-800">
+        <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-2">Manuscript Map</label>
         {state.sections.map(section => (
-          <button
-            key={section.id}
-            onClick={() => {
-              const el = document.getElementById(`section-${section.id}`);
-              el?.scrollIntoView({ behavior: 'smooth' });
-              setState(prev => ({ ...prev, activeSectionId: section.id }));
-            }}
-            className={`w-full text-left px-3 py-2 rounded text-sm transition-all flex items-center justify-between group border-l-2 ${
-              state.activeSectionId === section.id 
-                ? 'bg-slate-800 text-teal-400 border-teal-500 shadow-md' 
-                : 'border-transparent text-slate-400 hover:bg-slate-900 hover:text-slate-200'
-            }`}
-          >
+          <button key={section.id} onClick={() => { document.getElementById(`section-${section.id}`)?.scrollIntoView({ behavior: 'smooth' }); setState(prev => ({ ...prev, activeSectionId: section.id })); }} className={`w-full text-left px-3 py-2 rounded text-xs transition-all flex items-center justify-between border-l-2 ${state.activeSectionId === section.id ? 'bg-slate-800 text-teal-400 border-teal-500 shadow-md' : 'border-transparent text-slate-400 hover:bg-slate-900'}`}>
             <span>{section.type}</span>
-            {section.content && <span className="w-1.5 h-1.5 rounded-full bg-teal-500 shadow-[0_0_8px_rgba(20,184,166,0.5)]"></span>}
+            {section.content && <span className="w-1.5 h-1.5 rounded-full bg-teal-500 shadow-[0_0_5px_rgba(20,184,166,0.6)]"></span>}
           </button>
         ))}
-      </nav>
+      </div>
+      
+      {lastSaved && <div className="text-[9px] text-center text-slate-700 pt-4">Auto-save active • {lastSaved.toLocaleTimeString()}</div>}
     </div>
   );
 
-  if (apiKeyMissing) {
-     return (
-        <div className="flex h-screen items-center justify-center bg-slate-950 text-white p-6">
-           <div className="max-w-md text-center">
-              <h2 className="text-2xl font-bold mb-4 text-red-500">Configuration Error</h2>
-              <p>The <code>API_KEY</code> environment variable is missing.</p>
-           </div>
-        </div>
-     )
-  }
+  if (apiKeyMissing) return (
+    <div className="flex h-screen items-center justify-center bg-slate-950 text-white p-6 relative overflow-hidden">
+       <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-indigo-900/20 via-slate-950 to-slate-950"></div>
+       <div className="relative z-10 max-w-md text-center p-8 border border-red-900/50 bg-slate-900/50 backdrop-blur-xl rounded-2xl shadow-2xl">
+          <h2 className="text-3xl font-bold mb-4 text-red-500 font-serif">System Halted</h2>
+          <p className="text-slate-400 mb-6">Critical Configuration Missing: <code>API_KEY</code></p>
+          <div className="bg-slate-950 p-4 rounded text-xs text-left font-mono text-slate-500">
+             Please check your environment variables or metadata.json configuration.
+          </div>
+       </div>
+    </div>
+  );
 
   return (
     <Layout sidebar={SidebarContent}>
-      <div className="mb-10 space-y-6">
-         {state.noveltyClaim ? (
-            <div className="space-y-6">
-              {/* Main Analysis Card */}
-              <div className="relative group overflow-hidden rounded-xl bg-slate-900 border border-slate-700 p-8 shadow-2xl">
-                 <div className="absolute top-0 right-0 p-4 opacity-5 text-9xl font-serif text-teal-500 select-none">Q1</div>
-                 <div className="relative z-10">
-                      <div className="flex items-center gap-4 mb-4 flex-wrap">
-                          <span className="bg-teal-900/50 text-teal-300 text-xs font-bold px-2 py-1 rounded border border-teal-800 uppercase tracking-widest">Q1 Blueprint Ready</span>
-                          {state.targetJournal && (
-                              <span className="bg-indigo-900/50 text-indigo-300 text-xs font-bold px-2 py-1 rounded border border-indigo-800 uppercase tracking-widest flex items-center">
-                                  <span className="mr-1">Venue:</span> {state.targetJournal}
-                              </span>
-                          )}
-                      </div>
-                     <h1 className="text-3xl font-serif text-slate-100 mb-6 leading-tight max-w-4xl">{state.paperTitle}</h1>
-                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6 text-sm">
-                        <div className="bg-slate-950/80 p-5 rounded-lg border border-indigo-900/30">
-                           <span className="text-indigo-400 font-bold uppercase text-xs tracking-wide block mb-2">Research Gap & Contribution</span>
-                           <p className="text-slate-300 leading-relaxed font-serif mb-3"><strong className="text-indigo-300">SOTA Weakness:</strong> {state.researchGap}</p>
-                           <p className="text-slate-300 leading-relaxed font-serif"><strong className="text-indigo-300">Novelty:</strong> {state.noveltyClaim}</p>
-                        </div>
-                        <div className="bg-slate-950/80 p-5 rounded-lg border border-teal-900/30">
-                           <span className="text-teal-400 font-bold uppercase text-xs tracking-wide block mb-2">Methodology & Experiments</span>
-                           <p className="text-slate-300 leading-relaxed font-serif mb-3">{state.methodologyPlan}</p>
-                           {state.expectedResults && <p className="text-xs text-teal-500/80 mt-2 border-t border-teal-900/30 pt-2"><strong className="text-teal-400">Claims:</strong> {state.expectedResults}</p>}
-                        </div>
-                     </div>
-                 </div>
-              </div>
+      <div className="relative">
+        {errorMsg && (
+          <div className="fixed top-4 right-4 z-50 bg-red-900/90 border border-red-700 text-white px-6 py-4 rounded-lg shadow-2xl backdrop-blur-md animate-bounce">
+            <div className="font-bold mb-1">System Alert</div>
+            <div className="text-sm">{errorMsg}</div>
+            <button onClick={() => setErrorMsg(null)} className="absolute top-1 right-2 text-red-300 hover:text-white">×</button>
+          </div>
+        )}
 
-              {/* Quality Checklist */}
-              {state.qualityChecklist && (
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                   <div className="bg-emerald-900/20 border border-emerald-900/40 p-3 rounded-lg">
-                      <h4 className="text-emerald-400 text-xs font-bold uppercase mb-1">Novelty Check</h4>
-                      <p className="text-emerald-100/70 text-xs">{state.qualityChecklist.novelty_check}</p>
-                   </div>
-                   <div className="bg-blue-900/20 border border-blue-900/40 p-3 rounded-lg">
-                      <h4 className="text-blue-400 text-xs font-bold uppercase mb-1">Impact Check</h4>
-                      <p className="text-blue-100/70 text-xs">{state.qualityChecklist.significance_check}</p>
-                   </div>
-                   <div className="bg-purple-900/20 border border-purple-900/40 p-3 rounded-lg">
-                      <h4 className="text-purple-400 text-xs font-bold uppercase mb-1">Clarity Check</h4>
-                      <p className="text-purple-100/70 text-xs">{state.qualityChecklist.clarity_check}</p>
-                   </div>
-                   <div className="bg-amber-900/20 border border-amber-900/40 p-3 rounded-lg">
-                      <h4 className="text-amber-400 text-xs font-bold uppercase mb-1">Fit Check</h4>
-                      <p className="text-amber-100/70 text-xs">{state.qualityChecklist.journal_fit_check}</p>
+        <div className="mb-12 space-y-8">
+           {state.noveltyClaim ? (
+              <div className="space-y-8 animate-fade-in-up">
+                <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-700 p-10 shadow-2xl">
+                   <div className="absolute top-0 right-0 p-4 opacity-5 text-9xl font-serif text-teal-500 select-none pointer-events-none">Q1</div>
+                   <div className="relative z-10">
+                        <div className="flex items-center gap-4 mb-6 flex-wrap">
+                            <span className="bg-teal-500/10 text-teal-300 text-xs font-bold px-3 py-1.5 rounded-full border border-teal-500/20 uppercase tracking-widest shadow-[0_0_10px_rgba(20,184,166,0.2)]">Active Blueprint</span>
+                            {state.targetJournal && <span className="bg-indigo-500/10 text-indigo-300 text-xs font-bold px-3 py-1.5 rounded-full border border-indigo-500/20 uppercase tracking-widest">Target: {state.targetJournal}</span>}
+                        </div>
+                       <h1 className="text-4xl font-serif text-slate-100 mb-8 leading-tight max-w-5xl tracking-tight">{state.paperTitle}</h1>
+                       <div className="grid grid-cols-1 md:grid-cols-2 gap-8 text-sm">
+                          <div className="bg-slate-950/50 p-6 rounded-xl border border-indigo-500/20 hover:border-indigo-500/40 transition-colors">
+                             <span className="text-indigo-400 font-bold uppercase text-xs tracking-wide block mb-3">Strategic Gap</span>
+                             <p className="text-slate-300 leading-relaxed font-serif mb-4"><strong className="text-indigo-300">Gap:</strong> {state.researchGap}</p>
+                             <p className="text-slate-300 leading-relaxed font-serif"><strong className="text-indigo-300">Novelty:</strong> {state.noveltyClaim}</p>
+                          </div>
+                          <div className="bg-slate-950/50 p-6 rounded-xl border border-teal-500/20 hover:border-teal-500/40 transition-colors">
+                             <span className="text-teal-400 font-bold uppercase text-xs tracking-wide block mb-3">Technical Execution</span>
+                             <p className="text-slate-300 leading-relaxed font-serif mb-4">{state.methodologyPlan}</p>
+                             {state.expectedResults && <div className="text-xs text-teal-500/80 mt-2 border-t border-teal-500/10 pt-3"><strong className="text-teal-400">Key Claims:</strong> {state.expectedResults}</div>}
+                          </div>
+                       </div>
                    </div>
                 </div>
-              )}
+                {state.qualityChecklist && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                     {Object.entries(state.qualityChecklist).map(([key, val]) => (
+                       <div key={key} className="bg-slate-900/50 border border-slate-800 p-4 rounded-xl hover:bg-slate-800/50 transition-colors group">
+                          <h4 className="text-teal-500/70 group-hover:text-teal-400 text-[10px] font-bold uppercase mb-2 tracking-widest">{key.replace('_check','')}</h4>
+                          <p className="text-slate-400 group-hover:text-slate-300 text-xs leading-relaxed">{val}</p>
+                       </div>
+                     ))}
+                  </div>
+                )}
+              </div>
+           ) : (
+              <div className="text-center py-32 bg-slate-900/30 rounded-3xl border border-dashed border-slate-800 flex flex-col items-center justify-center group hover:border-slate-700 transition-all">
+                 <div className="w-24 h-24 bg-slate-800 rounded-full flex items-center justify-center mb-6 shadow-2xl group-hover:scale-105 transition-transform">
+                    <svg className="w-10 h-10 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" /></svg>
+                 </div>
+                 <h3 className="text-3xl font-serif text-slate-200 mb-3 tracking-tight">Novus Academica</h3>
+                 <p className="text-slate-500 max-w-lg mx-auto mb-8 leading-relaxed">
+                   Upload your raw research materials (PDF, TXT, LaTeX) to the deck. 
+                   The <span className="text-indigo-400 font-medium">Neural CPO</span> will analyze them for Q1 impact gaps.
+                 </p>
+              </div>
+           )}
+        </div>
+        
+        <div className="space-y-20 pb-48">
+          {state.sections.map(section => (
+            <div key={section.id} id={`section-${section.id}`} className="scroll-mt-6">
+              <SectionEditor section={section} onUpdate={(id, c) => setState(p => ({...p, sections: p.sections.map(s => s.id === id ? {...s, content: c} : s)}))} onGenerate={handleGenerateSection} />
             </div>
-         ) : (
-            <div className="text-center py-24 bg-gradient-to-b from-slate-900 to-slate-950 rounded-2xl border border-dashed border-slate-800 flex flex-col items-center justify-center">
-               <div className="w-20 h-20 bg-slate-800 rounded-full flex items-center justify-center mb-6 shadow-inner text-slate-600">
-                  <svg className="w-10 h-10" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.428 15.428a2 2 0 00-1.022-.547l-2.384-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" /></svg>
+          ))}
+        </div>
+        
+        {/* NEURAL CONSULTANT CHAT OVERLAY */}
+        <div className={`fixed bottom-0 right-8 w-96 bg-slate-950 border border-slate-700 rounded-t-xl shadow-2xl transition-transform duration-300 z-50 flex flex-col ${state.isChatOpen ? 'translate-y-0 h-[650px]' : 'translate-y-[600px] h-[650px] hover:translate-y-[590px]'}`}>
+          <div className="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900/80 backdrop-blur rounded-t-xl cursor-pointer hover:bg-slate-900 transition-colors" onClick={() => setState(p => ({...p, isChatOpen: !p.isChatOpen}))}>
+             <div className="flex items-center gap-3">
+               <div className="relative">
+                 <div className={`w-2.5 h-2.5 rounded-full ${state.noveltyClaim ? 'bg-emerald-500 animate-pulse' : 'bg-slate-600'}`}></div>
+                 {state.noveltyClaim && <div className="absolute inset-0 w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping opacity-75"></div>}
                </div>
-               <h3 className="text-2xl font-serif font-medium text-slate-200 mb-2">Chief Publication Officer (CPO)</h3>
-               <p className="text-slate-500 max-w-md mx-auto leading-relaxed">
-                 Upload your raw research materials. I will act as your CPO to identify <span className="text-indigo-400 font-medium">Q1 gaps</span>, enforce <span className="text-indigo-400 font-medium">Writing Order 2A</span>, and generate a <span className="text-indigo-400 font-medium">submission-ready</span> manuscript.
-               </p>
-            </div>
-         )}
-      </div>
-
-      <div className="space-y-16 pb-32">
-        {state.sections.map(section => (
-          <div key={section.id} id={`section-${section.id}`} className="scroll-mt-6">
-            <SectionEditor 
-              section={section}
-              onUpdate={handleUpdateSection}
-              onGenerate={handleGenerateSection}
-            />
+               <div>
+                  <div className="font-bold text-sm text-slate-100">Neural CPO</div>
+                  <div className="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Consultant Active</div>
+               </div>
+             </div>
+             <button className="text-slate-400 hover:text-white p-2">{state.isChatOpen ? '▼' : '▲'}</button>
           </div>
-        ))}
+          
+          <div className="flex-1 overflow-y-auto p-5 space-y-6 bg-slate-950/95 custom-scrollbar">
+             {state.chatHistory.length === 0 && (
+               <div className="text-center text-slate-600 text-xs py-10">
+                 Ask questions about your manuscript strategy, reviewer objections, or statistical methods.
+               </div>
+             )}
+             {state.chatHistory.map((msg, idx) => (
+               <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-2xl p-4 text-sm leading-relaxed shadow-sm ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-slate-800 text-slate-200 rounded-bl-none border border-slate-700'}`}>
+                    {msg.text}
+                  </div>
+               </div>
+             ))}
+             {isChatting && (
+               <div className="flex justify-start">
+                 <div className="bg-slate-800 rounded-2xl rounded-bl-none p-4 border border-slate-700 flex gap-1">
+                    <span className="w-1.5 h-1.5 bg-slate-500 rounded-full animate-bounce"></span>
+                    <span className="w-1.5 h-1.5 bg-slate-500 rounded-full animate-bounce delay-100"></span>
+                    <span className="w-1.5 h-1.5 bg-slate-500 rounded-full animate-bounce delay-200"></span>
+                 </div>
+               </div>
+             )}
+             <div ref={chatEndRef}></div>
+          </div>
+          
+          <form onSubmit={handleChatSubmit} className="p-4 border-t border-slate-800 bg-slate-900/90 backdrop-blur rounded-b-none">
+             <div className="relative group">
+               <input 
+                 type="text" 
+                 value={chatInput} 
+                 onChange={e => setChatInput(e.target.value)} 
+                 placeholder="Ask the CPO..." 
+                 className="w-full bg-slate-950 border border-slate-700 rounded-lg py-3 px-4 text-sm text-white focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 transition-all pr-12 placeholder-slate-600"
+               />
+               <button 
+                 type="submit" 
+                 disabled={!chatInput.trim() || isChatting} 
+                 className="absolute right-2 top-2 p-1.5 rounded-md text-indigo-500 hover:bg-indigo-500/10 hover:text-indigo-400 disabled:opacity-30 disabled:hover:bg-transparent transition-all"
+               >
+                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+               </button>
+             </div>
+          </form>
+        </div>
       </div>
     </Layout>
   );

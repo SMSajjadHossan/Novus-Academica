@@ -32,6 +32,12 @@ export interface QualityChecklist {
   journal_fit_check: string;
 }
 
+export interface ChatMessage {
+  role: 'user' | 'model';
+  text: string;
+  timestamp: number;
+}
+
 export interface ResearchState {
   files: UploadedFile[];
   paperTitle: string;
@@ -42,9 +48,15 @@ export interface ResearchState {
   methodologyPlan: string;
   expectedResults: string;
   qualityChecklist: QualityChecklist | null;
+  extractedReferences: string[]; // New: References found in source files
   
+  // Chat State
+  chatHistory: ChatMessage[];
+  isChatOpen: boolean;
+
   sections: PaperSection[];
   activeSectionId: string | null;
 }
 
 export type HumanizeLevel = 'Standard' | 'Academic-Flow' | 'High-Burstiness';
+export type MagicToolType = 'Expand' | 'Condense' | 'FixGrammar' | 'MakeRigorous';
